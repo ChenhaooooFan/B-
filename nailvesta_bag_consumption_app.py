@@ -61,6 +61,18 @@ def to_float(x):
         return 0.0
 
 
+# 不同 pandas 版本把缺失值字符串化成 nan / NaN / <NA> 各不相同，统一按此判空
+NA_STRS = {"", "nan", "nat", "none", "<na>", "null"}
+
+
+def _blank(series):
+    """返回布尔 Series：True=该格为空/缺失。
+    先转可空字符串，用 isna() 抓真正的缺失(pandas 3.x 里 NA 不会被 astype(str) 变成 'nan')，
+    再兜底匹配字面量 nan/NaN/<NA>/空串等，兼容 pandas 1.x~3.x。"""
+    s = series.astype("string")
+    return s.isna() | s.str.strip().str.lower().isin(NA_STRS)
+
+
 def styles_of(cell):
     """把 '款式A, 款式B' 拆成 ['款式A','款式B']。"""
     return [s.strip() for s in str(cell or "").split(",") if s.strip()]
@@ -206,11 +218,18 @@ def normalize_shopify(df):
     df["_nail"] = df["sku"].map(is_nail)          # 每个 Lineitem 行 = 1 副
     df["_box"] = df["sku"].map(is_box)
     df["_extra"] = df.apply(lambda r: 0 if r["_box"] else acc_pos_of(r["sku"]), axis=1)
-    df["_date"] = pd.to_datetime(df[c_date].astype(str).str.strip(),
-                                 errors="coerce", format="mixed") if c_date else pd.NaT
+    if c_date:
+        # Shopify 时间戳带时区偏移(如 -0700/-0800，夏令时切换会混用两种)。
+        # pandas 2.x 遇到混合偏移会报 "Mixed timezones detected"；这里去掉偏移按本地时间解析，
+        # 保住下单当天的本地日期(用 utc=True 会把傍晚单推到次日 UTC，日期就错了)。
+        _d = df[c_date].astype(str).str.strip().str.replace(
+            r"\s*[+-]\d{2}:?\d{2}$", "", regex=True)
+        df["_date"] = pd.to_datetime(_d, errors="coerce", format="mixed")
+    else:
+        df["_date"] = pd.NaT
     df["_sub"] = df[c_sub].map(to_float) if c_sub else 0.0
     df["_total"] = df[c_total].map(to_float) if c_total else 0.0
-    df["_cancel"] = df[c_cancel].astype(str).str.strip() if c_cancel else ""
+    df["_cancel"] = (~_blank(df[c_cancel])) if c_cancel else False  # 有取消时间=真取消
     df["_fin"] = df[c_fin].astype(str).str.strip().str.lower() if c_fin else ""
 
     g = df.groupby(c_id, sort=False)
@@ -223,7 +242,7 @@ def normalize_shopify(df):
         "subtotal": g["_sub"].max().values,       # 商品小计(不含运费税)
         "order_amount": g["_total"].max().values,  # 实付总额
     })
-    cancel = g["_cancel"].apply(lambda s: any(x not in ("", "nan") for x in s)).values
+    cancel = g["_cancel"].apply(lambda s: bool(s.any())).values
     void = g["_fin"].apply(lambda s: any(x in ("voided", "cancelled", "canceled") for x in s)).values
     out["canceled"] = cancel | void
     out["channel"] = "独立站"
