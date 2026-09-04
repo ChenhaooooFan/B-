@@ -250,13 +250,15 @@ def normalize_shopify(df):
 
 
 def normalize_daren(df):
-    """深度达人单：Handle=订单，款式(逗号分隔)=款式；配件名按占位算。"""
-    return _build_waterslip(df, "Handle", "款式", "达人单")
+    """深度达人单：Handle=订单，款式(逗号分隔)=款式；配件名按占位算。
+    渠道统一记「水单」——达人单与客人单合并统计，不再分开。"""
+    return _build_waterslip(df, "Handle", "款式", "水单")
 
 
 def normalize_putong(df):
-    """普通水单【客人+广达】：Order ID=订单，Product Name(逗号分隔)=款式；配件名按占位算。"""
-    return _build_waterslip(df, "Order ID", "Product Name", "普通水单")
+    """普通水单【客人+广达】：Order ID=订单，Product Name(逗号分隔)=款式；配件名按占位算。
+    渠道统一记「水单」——与深度达人单合并统计，不再分开。"""
+    return _build_waterslip(df, "Order ID", "Product Name", "水单")
 
 
 def read_any(file):
@@ -313,6 +315,8 @@ def apply_rules_and_pack(od, spend_rules, buy_rules, metric_col, small_max):
         lambda r: pack_order(r["n_nails"], r["n_box"], r["extra_pos"], small_max),
         axis=1, result_type="expand")
     od["big"], od["small"] = packed[0], packed[1]
+    # 工具包：每副实发指甲送 1 个(含赠品指甲)。n_nails 此时已是加赠后的实发副数。
+    od["toolkit"] = od["n_nails"].round().astype(int)
     return od
 
 
@@ -387,7 +391,7 @@ f_dr = u3.file_uploader("③ 水单·深度达人单", type=["csv", "xlsx"], key
 f_pt = u4.file_uploader("④ 水单·普通水单【客人+广达】", type=["csv", "xlsx"], key="f_pt")
 
 jobs = [(f_tt, normalize_tiktok, "TikTok"), (f_sp, normalize_shopify, "独立站"),
-        (f_dr, normalize_daren, "达人单"), (f_pt, normalize_putong, "普通水单")]
+        (f_dr, normalize_daren, "水单·深度达人"), (f_pt, normalize_putong, "水单·普通")]
 parts = []
 for f, fn, label in jobs:
     if f is None:
@@ -417,7 +421,8 @@ od = apply_rules_and_pack(od, spend_rules, buy_rules, metric_col, SMALL_MAX)
 # ---------- 按日聚合 ----------
 daily = od.groupby("date").agg(
     订单=("order_id", "count"), 赠折叠盒=("g_box", "sum"),
-    大飞机袋=("big", "sum"), 小飞机袋=("small", "sum")).reset_index().sort_values("date")
+    大飞机袋=("big", "sum"), 小飞机袋=("small", "sum"),
+    工具包=("toolkit", "sum")).reset_index().sort_values("date")
 
 max_d, min_d = daily["date"].max(), daily["date"].min()
 w14 = daily[daily["date"] >= max_d - timedelta(days=13)]
@@ -444,8 +449,55 @@ st.caption(f"数据日期：{min_d} ~ {max_d} · 门槛口径：{metric_choice} 
 # ---------- 分渠道 ----------
 st.markdown("### 分渠道（全期）")
 ch = od.groupby("channel").agg(订单=("order_id", "count"),
-                               大飞机袋=("big", "sum"), 小飞机袋=("small", "sum")).reset_index()
+                               大飞机袋=("big", "sum"), 小飞机袋=("small", "sum"),
+                               工具包=("toolkit", "sum")).reset_index()
 st.dataframe(ch, use_container_width=True, hide_index=True)
+
+# ---------- 工具包消耗（每副实发指甲送 1 个 · 含赠品） ----------
+st.markdown("## 🧰 工具包消耗（每副实发指甲送 1 个 · 含赠品指甲）")
+present = [c for c in ["TikTok", "独立站", "水单"] if c in set(od["channel"])]
+
+
+def kit_sum(days):
+    w = od[od["date"] >= max_d - timedelta(days=days - 1)]
+    return w.groupby("channel")["toolkit"].sum()
+
+
+k7, k14 = kit_sum(7), kit_sum(14)
+kit_tbl = pd.DataFrame({
+    "渠道": present,
+    "近7天": [int(k7.get(c, 0)) for c in present],
+    "近14天": [int(k14.get(c, 0)) for c in present],
+})
+kit_tbl["日均(近14天)"] = (kit_tbl["近14天"] / 14).round(1)
+kit_tbl.loc[len(kit_tbl)] = ["合计", int(kit_tbl["近7天"].sum()),
+                             int(kit_tbl["近14天"].sum()),
+                             round(kit_tbl["近14天"].sum() / 14, 1)]
+st.dataframe(kit_tbl, use_container_width=True, hide_index=True)
+st.caption("工具包数 = 实发指甲副数(含赠品)。独立站的赠指甲需在「规则②·买副赠·指甲」配置并启用后才会计入。")
+
+# TikTok 订单按「指甲副数」分桶，核对工具包用量（req①）
+if "TikTok" in present:
+    st.markdown("### TikTok 近 14 天 · 订单 item 分布（item = 指甲副数）")
+    tk = od[(od["channel"] == "TikTok") &
+            (od["date"] >= max_d - timedelta(days=13))].copy()
+    tk["副数"] = tk["n_nails"].round().astype(int)
+
+    def bkt(n):
+        if n <= 0:
+            return "0(无指甲)"
+        return "4+" if n >= 4 else str(n)
+
+    tk["档"] = tk["副数"].map(bkt)
+    labels = [b for b in ["1", "2", "3", "4+", "0(无指甲)"] if (tk["档"] == b).any()]
+    rows = [{"每单指甲副数": b,
+             "订单数": int((tk["档"] == b).sum()),
+             "工具包数": int(tk.loc[tk["档"] == b, "副数"].sum())} for b in labels]
+    rows.append({"每单指甲副数": "合计", "订单数": int(len(tk)),
+                 "工具包数": int(tk["副数"].sum())})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption(f"TikTok 近 14 天工具包合计 = {int(tk['副数'].sum())} 个"
+               f"（1/2/3 档 = 订单数 × 该档副数；4+ 档按各单实际副数累加）。")
 
 # ---------- 赠品汇总 ----------
 gb, gp, gd, gn = int(od["g_box"].sum()), int(od["g_pen"].sum()), int(od["g_binder"].sum()), int(od["g_nail"].sum())
@@ -462,11 +514,13 @@ st.dataframe(show.rename(columns={"date": "日期"}), use_container_width=True, 
 st.markdown("## 🧮 补货建议")
 big_avg = w14["大飞机袋"].sum() / 14
 small_avg = w14["小飞机袋"].sum() / 14
+kit_avg = w14["工具包"].sum() / 14
 normal = w14[w14["赠折叠盒"] == 0]
 box_days = daily[daily["赠折叠盒"] > 0]
 st.markdown(
     f"- **小飞机袋**：按 **≈ {small_avg:.0f} 个/天** 备货，基本不受促销影响。\n"
-    f"- **大飞机袋**：平日 **≈ {(normal['大飞机袋'].mean() if len(normal) else big_avg):.0f} 个/天**。")
+    f"- **大飞机袋**：平日 **≈ {(normal['大飞机袋'].mean() if len(normal) else big_avg):.0f} 个/天**。\n"
+    f"- **工具包**：按 **≈ {kit_avg:.0f} 个/天** 备货（= 实发指甲副数，含赠品，与指甲出货量同步）。")
 if len(box_days):
     st.warning("⚠️ **折叠盒赠品日单独加备**（每个赠盒占满一整个大袋）：\n\n" +
                "\n".join(f"- {r['date']}：大飞机袋 {int(r['大飞机袋'])} 个（赠盒 {int(r['赠折叠盒'])} 个）"
@@ -480,8 +534,9 @@ with st.expander("📖 计算口径与假设"):
 - **只排除取消单**；**零元单全部保留**。
 - **TikTok**：1 Order ID = 1 单，指甲 SKU 行数 = 副数；免费赠指甲($0 行)已在表内自动计入。
 - **独立站**：1 订单号 = 1 单，指甲 Lineitem 行数 = 副数；免费赠指甲不在表内，用「买副赠·指甲(独立站)」补。
-- **深度达人单 / 普通水单**：1 handle(或 Order ID) = 1 单，款式名数(逗号分隔) = 副数；发货清单已含实发赠品，**不再叠加赠品**。款式名里若出现 storage box/binder/kit/remover/pen 等**配件名**，按占位规则算(折叠盒占满大袋、册4位、笔/kit/remover 2位)、不当指甲副。
+- **水单（深度达人单 + 普通水单【客人+广达】合并为「水单」，不再分开）**：1 handle(或 Order ID) = 1 单，款式名数(逗号分隔) = 副数；发货清单已含实发赠品，**不再叠加赠品**。款式名里若出现 storage box/binder/kit/remover/pen 等**配件名**，按占位规则算(折叠盒占满大袋、册4位、笔/kit/remover 2位)、不当指甲副。
 - **配件占位**：折叠盒 6 位(占满一个大袋)、美甲册 4 位、卸甲笔 2 位、Kit/Toolkit 按 2 位。
+- **工具包（每副实发指甲送 1 个 · 含赠品指甲）**：工具包数 = 各渠道实发指甲副数（`toolkit = n_nails`，含赠品）。TikTok 单独按「每单指甲副数」分 1/2/3/4+ 桶，便于核对用量；独立站/水单也各自出工具包合计。独立站赠指甲要计入工具包，需在「规则②·买副赠·指甲」配置并启用。工具包**只单独统计，不占飞机袋位、不改袋型**。
 - **规则③**：3 副→大袋 时小袋装 1–2 副；3 副→小袋 时小袋装 1–3 副（同时影响 >6 副的余数判断）。
 - **过去 7/14 天**：以表内最后一天为基准往前推 7 / 14 个自然日；日均 = 合计 ÷ 7(或 14)。
     """)
