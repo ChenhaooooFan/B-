@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 NailVesta 飞机袋消耗测算（4 来源：TikTok + 独立站 + 深度达人单 + 普通水单）
-先手动配置 4 项规则 → 上传订单表 → 自动算「过去 7 天 / 过去 14 天」的小/大飞机袋、飞机盒、工具包日均，
-并给出每单件数分布(1/2/3/4/5/6+)供复核。
+先手动配置规则 → 上传订单表 → 自动算「过去 7 天 / 过去 14 天」的小/大飞机袋、飞机盒、工具包日均，
+并给出每单件数分布供复核。
 
 手动规则：
   ① 满多少钱送什么（满额赠）
   ② 买几副送什么（买副赠，独立站赠指甲用它补）
-  ③ 买 3 件用大袋还是小袋（决定小袋上限 2 或 3 件）
-  ④ 袋子自带工具包数（小/大各 0~3，默认小 1、大 3；缺大袋改自购时把大袋设 0）
+  ③ 袋子自带工具包数（小袋 0~3、大袋 0~10，默认小 1、大 3；缺大袋改自购时把大袋设 0）
 
-包装规则（纯按指甲件数分档）：
-  1~小袋上限 件 → 小飞机袋；到 5 件 → 大飞机袋；6 件及以上 → 飞机盒(内无工具包)。
-  工具包消耗：小袋 max(0, 件数−小袋自带)、大袋 max(0, 件数−大袋自带)、飞机盒 0。
+包装规则（按订单日期自动切换 · 纯按指甲件数分档）：
+  1~2 副 → 1 个小飞机袋（两个时段一致）。
+  ≤ 9/14（旧）：3~10 副 → 1 个大飞机袋；>10 副 → 飞机盒。
+  ≥ 9/15（新 · 以后默认）：3~8 副 → 1 个大飞机袋；≥9 副 → 飞机盒。
+  装盒：指甲先按当期容量(旧 10/新 8)拆成多个大飞机袋(向上取整)，大飞机袋每 2 个装进 1 个飞机盒(向上取整)。
+  工具包消耗：每个袋内 max(0, 袋内件数−该袋自带) 之和(装盒单逐袋算)；飞机盒只是外层容器、本身不带工具包。
   不再按配件占位换袋——配件名只是「不计入指甲件数」。
 
 数据口径：
@@ -31,7 +33,16 @@ import streamlit as st
 st.set_page_config(page_title="NailVesta 飞机袋消耗测算", page_icon="✈️", layout="wide")
 
 # ============ 物料 / 打包配置 ============
-BIG_CAP = 6  # 大飞机袋 = 6 个指甲位
+SMALL_MAX = 2       # 1~2 副 → 小飞机袋（两个时段一致）
+BOX_BAGS = 2        # 一个飞机盒最多装 2 个大飞机袋
+STRATEGY_CUTOFF = date(2026, 9, 15)  # 打包策略切换日：≥9/15 用新策略、之前用旧策略
+BAG_CAP_OLD = 10    # 9/15 前：大飞机袋每袋 ≤10 副（3~10 副 1 袋，>10 装盒）
+BAG_CAP_NEW = 8     # 9/15 起：大飞机袋每袋 ≤8 副（3~8 副 1 袋，≥9 装盒）
+
+
+def bag_cap_for(d):
+    """按订单日期取当期大飞机袋每袋容量：≥9/15 用新策略(8)、之前旧策略(10)。"""
+    return BAG_CAP_NEW if d >= STRATEGY_CUTOFF else BAG_CAP_OLD
 
 # 配件 Seller SKU → (显示名, 占用指甲位)
 ACCESSORY_POS = {
@@ -124,27 +135,39 @@ def is_nail(sku):
     return str(sku).strip() not in ACCESSORY_POS
 
 
-def package_of(n_nails, small_max):
-    """按指甲件数定包装，返回 (小飞机袋, 大飞机袋, 飞机盒)，每单恰好 1 个(0 件除外)。
-    1~small_max 件→小袋；(small_max+1)~5 件→大袋；6 件及以上→飞机盒。"""
+def big_bag_split(n, cap):
+    """走大飞机袋时把 n 副按每袋最多 cap 副拆分，返回各袋副数列表(最后一袋装余数)。"""
+    bags = []
+    while n > 0:
+        bags.append(min(cap, n))
+        n -= cap
+    return bags
+
+
+def package_of(n_nails, cap):
+    """按指甲件数定包装，返回 (小飞机袋, 大飞机袋, 飞机盒) 的个数。cap=当期大飞机袋容量。
+    1~2 副 → 1 小袋；3~cap 副 → 1 大袋；
+    >cap 副 → 每 cap 副 1 大袋(向上取整)，大飞机袋每 2 个装进 1 个飞机盒(向上取整)。"""
     n = int(round(n_nails))
     if n <= 0:
         return 0, 0, 0
-    if n >= 6:
-        return 0, 0, 1          # 飞机盒
-    if n <= small_max:
-        return 1, 0, 0          # 小飞机袋
-    return 0, 1, 0              # 大飞机袋(small_max+1 ~ 5)
+    if n <= SMALL_MAX:
+        return 1, 0, 0                              # 小飞机袋
+    big = len(big_bag_split(n, cap))                # 每袋≤cap 副
+    box = -(-big // BOX_BAGS) if big > 1 else 0     # 2 个大袋装 1 盒；单个大袋不装盒
+    return 0, big, box                              # 大飞机袋×big（装盒时 box≥1）
 
 
-def toolkit_of(n_nails, small_builtin, big_builtin, small_max):
-    """工具包消耗：小袋 max(0, 件数−小袋自带)；大袋 max(0, 件数−大袋自带)；飞机盒 0(无工具包)。"""
+def toolkit_of(n_nails, small_builtin, big_builtin, cap):
+    """工具包消耗 = 每个袋子内 max(0, 袋内指甲件数 − 该袋自带数) 之和。
+    小袋按 small_builtin；大袋按 big_builtin（>cap 件拆多袋、逐袋算）。
+    飞机盒只是外层容器，工具包都在里面的大飞机袋里算。"""
     n = int(round(n_nails))
-    if n <= 0 or n >= 6:
+    if n <= 0:
         return 0
-    if n <= small_max:
+    if n <= SMALL_MAX:
         return max(0, n - small_builtin)
-    return max(0, n - big_builtin)
+    return sum(max(0, k - big_builtin) for k in big_bag_split(n, cap))
 
 
 # ============ 4 个解析器 → 统一「订单级」表 ============
@@ -275,8 +298,9 @@ def read_any(file):
     return pd.read_csv(file, dtype=str, encoding="utf-8-sig")
 
 
-def apply_rules_and_pack(od, spend_rules, buy_rules, metric_col, small_max):
-    """对合并后的订单级表应用赠品规则(仅 TK/独立站)并装袋，返回带 big/small 的表。"""
+def apply_rules_and_pack(od, spend_rules, buy_rules, metric_col):
+    """对合并后的订单级表应用赠品规则(仅 TK/独立站)并装袋，返回带 big/small 的表。
+    装袋按每单订单日期切换策略(bag_cap_for)：≤9/14 大袋≤10 副、≥9/15 大袋≤8 副。"""
     od = od.copy()
     od["n_nails_purchased"] = od["n_nails"]        # 买副赠门槛用「加赠前」副数
     for c in ["g_box", "g_pen", "g_binder", "g_nail"]:
@@ -321,10 +345,11 @@ def apply_rules_and_pack(od, spend_rules, buy_rules, metric_col, small_max):
 
     n = od["n_nails"].round().astype(int)
     od["件数"] = n
-    pk = n.map(lambda x: package_of(x, small_max))
-    od["small"] = pk.map(lambda t: t[0])   # 小飞机袋
-    od["big"] = pk.map(lambda t: t[1])     # 大飞机袋
-    od["box"] = pk.map(lambda t: t[2])     # 飞机盒(6 件及以上)
+    od["cap"] = od["date"].map(bag_cap_for)         # 每单按订单日期取当期大袋容量
+    pk = [package_of(x, c) for x, c in zip(n, od["cap"])]
+    od["small"] = [t[0] for t in pk]                # 小飞机袋(个数)
+    od["big"] = [t[1] for t in pk]                  # 大飞机袋(个数，装盒单会 >1)
+    od["box"] = [t[2] for t in pk]                  # 飞机盒(个数)
     return od
 
 
@@ -342,25 +367,24 @@ st.caption("① 先配置规则(4 项) → ② 上传订单表(最多 4 份) →
 # ---------- 第一步：规则 ----------
 st.markdown("## ① 规则设置")
 
-st.markdown("**规则③：买 3 副用哪种袋子**（仓库有时会变）")
-bag3_choice = st.radio(
-    "买 3 副装：", ["大飞机袋（默认）", "小飞机袋"], index=0, horizontal=True,
-    label_visibility="collapsed")
-SMALL_MAX = 3 if bag3_choice.startswith("小") else 2  # 小袋最多装几副
-st.caption(f"当前：3 副 → {'小飞机袋（小袋最多装 3 副）' if SMALL_MAX==3 else '大飞机袋（小袋最多装 2 副）'}")
+st.markdown("**打包策略：按订单日期自动切换**（小袋固定 1~2 副；装盒每 2 个大飞机袋 1 盒）")
+st.markdown(
+    f"- **≤ 9/14（旧）**：1~2 副 → 小飞机袋；3~{BAG_CAP_OLD} 副 → 大飞机袋；>{BAG_CAP_OLD} 副 → 飞机盒。\n"
+    f"- **≥ 9/15（新 · 以后默认）**：1~2 副 → 小飞机袋；3~{BAG_CAP_NEW} 副 → 大飞机袋；≥{BAG_CAP_NEW+1} 副 → 飞机盒。\n"
+    f"- **装盒**：指甲先按当期容量(旧 {BAG_CAP_OLD}/新 {BAG_CAP_NEW})拆成多个大飞机袋，大飞机袋每 {BOX_BAGS} 个装进 1 个飞机盒。")
 
-st.markdown("**规则④：袋子自带工具包数**（手动选 0/1/2/3；缺大袋、改用自购大袋时把大袋改成 0）")
+st.markdown("**规则③：袋子自带工具包数**（手动选；缺大袋、改用自购大袋时把大袋改成 0）")
 bt1, bt2, _ = st.columns([1, 1, 2])
 SMALL_BUILTIN = bt1.number_input("小飞机袋自带", min_value=0, max_value=3, value=1, step=1)
-BIG_BUILTIN = bt2.number_input("大飞机袋自带", min_value=0, max_value=3, value=3, step=1)
-st.caption(f"工具包消耗 = 袋内指甲件数 − 该袋自带数(不足记 0)；6 件及以上装**飞机盒**、无工具包。"
-           f"当前：小袋自带 {SMALL_BUILTIN}、大袋自带 {BIG_BUILTIN}。"
-           f"例：1件→{toolkit_of(1,SMALL_BUILTIN,BIG_BUILTIN,SMALL_MAX)}、"
-           f"2件→{toolkit_of(2,SMALL_BUILTIN,BIG_BUILTIN,SMALL_MAX)}、"
-           f"3件→{toolkit_of(3,SMALL_BUILTIN,BIG_BUILTIN,SMALL_MAX)}、"
-           f"4件→{toolkit_of(4,SMALL_BUILTIN,BIG_BUILTIN,SMALL_MAX)}、"
-           f"5件→{toolkit_of(5,SMALL_BUILTIN,BIG_BUILTIN,SMALL_MAX)}、"
-           f"6件→{toolkit_of(6,SMALL_BUILTIN,BIG_BUILTIN,SMALL_MAX)}(盒)。")
+BIG_BUILTIN = bt2.number_input("大飞机袋自带", min_value=0, max_value=10, value=3, step=1)
+st.caption(f"工具包消耗 = 每个袋内(指甲件数 − 该袋自带数，不足记 0)之和；装盒的单拆多个大飞机袋逐袋算，飞机盒本身不带工具包。"
+           f"当前：小袋自带 {SMALL_BUILTIN}、大袋自带 {BIG_BUILTIN}（下面按 9/15 起策略·每袋≤{BAG_CAP_NEW} 副举例）："
+           f"1件→{toolkit_of(1,SMALL_BUILTIN,BIG_BUILTIN,BAG_CAP_NEW)}、"
+           f"3件→{toolkit_of(3,SMALL_BUILTIN,BIG_BUILTIN,BAG_CAP_NEW)}、"
+           f"8件→{toolkit_of(8,SMALL_BUILTIN,BIG_BUILTIN,BAG_CAP_NEW)}、"
+           f"9件(2袋)→{toolkit_of(9,SMALL_BUILTIN,BIG_BUILTIN,BAG_CAP_NEW)}、"
+           f"16件(2袋)→{toolkit_of(16,SMALL_BUILTIN,BIG_BUILTIN,BAG_CAP_NEW)}、"
+           f"17件(3袋)→{toolkit_of(17,SMALL_BUILTIN,BIG_BUILTIN,BAG_CAP_NEW)}。")
 
 rc1, rc2 = st.columns(2)
 with rc1:
@@ -437,9 +461,9 @@ if od.empty:
     st.stop()
 
 metric_col = "subtotal" if metric_choice.startswith("商品小计") else "order_amount"
-od = apply_rules_and_pack(od, spend_rules, buy_rules, metric_col, SMALL_MAX)
-od["toolkit"] = od["n_nails"].map(
-    lambda n: toolkit_of(n, SMALL_BUILTIN, BIG_BUILTIN, SMALL_MAX))
+od = apply_rules_and_pack(od, spend_rules, buy_rules, metric_col)
+od["toolkit"] = [toolkit_of(x, SMALL_BUILTIN, BIG_BUILTIN, c)
+                 for x, c in zip(od["n_nails"], od["cap"])]
 
 # ---------- 按日聚合 ----------
 daily = od.groupby("date").agg(
@@ -459,7 +483,7 @@ def block(win, days, label):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🟨 小飞机袋", f"{s:,}", f"日均 {s/days:.1f}")
     c2.metric("🟦 大飞机袋", f"{b:,}", f"日均 {b/days:.1f}")
-    c3.metric("📦 飞机盒(6件+)", f"{x:,}", f"日均 {x/days:.1f}")
+    c3.metric("📦 飞机盒", f"{x:,}", f"日均 {x/days:.1f}")
     c4.metric("🧰 工具包", f"{k:,}", f"日均 {k/days:.1f}")
 
 
@@ -467,8 +491,9 @@ st.markdown("## 📦 消耗汇总（全渠道合并）")
 block(w7, 7, "过去 7 天")
 block(w14, 14, "过去 14 天")
 st.caption(f"数据日期：{min_d} ~ {max_d} · 门槛口径：{metric_choice} · "
-           f"分档：小袋 1~{SMALL_MAX} 件、大袋 {SMALL_MAX+1}~5 件、飞机盒 6 件及以上 · "
-           f"自带工具包 小{SMALL_BUILTIN}/大{BIG_BUILTIN}/盒0")
+           f"分档(按订单日期)：≤9/14 小袋1~2/大袋3~{BAG_CAP_OLD}/飞机盒>{BAG_CAP_OLD}；"
+           f"≥9/15 小袋1~2/大袋3~{BAG_CAP_NEW}/飞机盒≥{BAG_CAP_NEW+1}；装盒每 {BOX_BAGS} 袋 1 盒 · "
+           f"自带工具包 小{SMALL_BUILTIN}/大{BIG_BUILTIN}")
 
 # ---------- 分渠道 ----------
 st.markdown("### 分渠道（全期）")
@@ -477,34 +502,40 @@ ch = od.groupby("channel").agg(订单=("order_id", "count"),
                                飞机盒=("box", "sum"), 工具包=("toolkit", "sum")).reset_index()
 st.dataframe(ch, use_container_width=True, hide_index=True)
 
-# ---------- 件数分布（复核 · 飞机盒消耗） ----------
-st.markdown("## 🔍 件数分布（每个包裹买了几件 · 复核用）")
+# ---------- 购买件数分布（逐件 · 从买 1 件到最多件） ----------
+st.markdown("## 🔍 购买件数分布（每个包裹买了几件 · 逐件统计）")
 o7 = od[od["date"] >= max_d - timedelta(days=6)]
 o14 = od[od["date"] >= max_d - timedelta(days=13)]
+vc7, vc14 = o7["件数"].value_counts(), o14["件数"].value_counts()
+max_n = int(o14["件数"].max()) if len(o14) else 0     # 近 14 天里最多买了几件
 
 
-def _cnt(win, key):
-    n = win["件数"]
-    return int((n >= 6).sum()) if key == "6+" else int((n == key).sum())
-
-
-def _pkg(key):
-    if key == "6+":
-        return "飞机盒"
-    if key == 0:
+def pkg_label(k):
+    """该购买件数走哪种包装（按分档）；9~10 件按订单日期不同。"""
+    if k <= 0:
         return "—"
-    s, b, _x = package_of(key, SMALL_MAX)
-    return "小飞机袋" if s else "大飞机袋"
+    if k <= SMALL_MAX:
+        return "小飞机袋"
+    if k <= BAG_CAP_NEW:                  # 3~8 副：两期都是 1 个大飞机袋
+        return "大飞机袋"
+    if k <= BAG_CAP_OLD:                  # 9~10 副：≤9/14 大飞机袋、≥9/15 飞机盒
+        return "≤9/14 大袋 · ≥9/15 盒"
+    return "飞机盒"                        # ≥11 副：两期都装盒
 
 
-dist_rows = [{"件数": lbl, "包装": _pkg(key),
-              "近7天(单)": _cnt(o7, key), "近14天(单)": _cnt(o14, key)}
-             for lbl, key in [("1 件", 1), ("2 件", 2), ("3 件", 3), ("4 件", 4),
-                              ("5 件", 5), ("6 件及以上", "6+"), ("0 件(无指甲)", 0)]]
-dist_rows.append({"件数": "合计", "包装": "", "近7天(单)": len(o7), "近14天(单)": len(o14)})
+dist_rows = [{"购买件数": f"{k} 件", "包装": pkg_label(k),
+              "近7天(单)": int(vc7.get(k, 0)), "近14天(单)": int(vc14.get(k, 0))}
+             for k in range(1, max_n + 1)]
+dist_rows.append({"购买件数": "0 件(无指甲)", "包装": "—",
+                  "近7天(单)": int(vc7.get(0, 0)), "近14天(单)": int(vc14.get(0, 0))})
+dist_rows.append({"购买件数": "合计", "包装": "",
+                  "近7天(单)": len(o7), "近14天(单)": len(o14)})
 st.dataframe(pd.DataFrame(dist_rows), use_container_width=True, hide_index=True)
-st.caption(f"📦 **飞机盒消耗** = 「6 件及以上」那行：近 7 天 {_cnt(o7,'6+')} 个、近 14 天 {_cnt(o14,'6+')} 个"
-           f"（飞机盒内无工具包）。分档随规则③：当前小袋 1~{SMALL_MAX} 件、大袋 {SMALL_MAX+1}~5 件。")
+box7, box14 = int(o7["box"].sum()), int(o14["box"].sum())
+bag7, bag14 = int(o7["big"].sum()), int(o14["big"].sum())
+st.caption(f"每行 = 恰好买 N 件指甲的订单数（件数 = 指甲副数，不含配件）。近 14 天最多买 {max_n} 件。"
+           f"实际消耗（近7/近14天）：大飞机袋 {bag7}/{bag14} 个、**飞机盒 {box7}/{box14} 个**（已计入上方汇总）；"
+           f"装盒的单把指甲拆成多个大飞机袋(每袋≤当期容量)、再每 {BOX_BAGS} 袋装 1 盒。")
 
 # ---------- 工具包消耗（袋子自带外的额外用量） ----------
 st.markdown(f"## 🧰 工具包消耗（小袋自带 {SMALL_BUILTIN}、大袋自带 {BIG_BUILTIN}，只记超出部分）")
@@ -527,7 +558,7 @@ kit_tbl.loc[len(kit_tbl)] = ["合计", int(kit_tbl["近7天"].sum()),
                              int(kit_tbl["近14天"].sum()),
                              round(kit_tbl["近14天"].sum() / 14, 1)]
 st.dataframe(kit_tbl, use_container_width=True, hide_index=True)
-st.caption(f"工具包消耗 = 小袋 max(0, 件数−{SMALL_BUILTIN})、大袋 max(0, 件数−{BIG_BUILTIN})、飞机盒(6件+) 记 0。"
+st.caption(f"工具包消耗 = 小袋 max(0, 件数−{SMALL_BUILTIN})、大袋 max(0, 袋内件数−{BIG_BUILTIN})；装盒的单拆多个大飞机袋逐袋算(飞机盒本身不额外带工具包)。"
            "独立站的赠指甲需在「规则②·买副赠·指甲」配置并启用后才会计入。")
 
 # ---------- 赠品汇总 ----------
@@ -548,11 +579,11 @@ big_avg = w14["大飞机袋"].sum() / 14
 box_avg = w14["飞机盒"].sum() / 14
 kit_avg = w14["工具包"].sum() / 14
 st.markdown(
-    f"- **小飞机袋**（1~{SMALL_MAX} 件）：按 **≈ {small_avg:.0f} 个/天** 备货。\n"
-    f"- **大飞机袋**（{SMALL_MAX+1}~5 件）：按 **≈ {big_avg:.0f} 个/天** 备货。\n"
-    f"- **飞机盒**（6 件及以上）：按 **≈ {box_avg:.1f} 个/天** 备货。\n"
-    f"- **工具包**：按 **≈ {kit_avg:.0f} 个/天** 备货（小袋自带 {SMALL_BUILTIN}、大袋自带 {BIG_BUILTIN}、飞机盒无）。")
-st.caption("飞机盒(6 件及以上)单独备货、内无工具包；达人批量发货日会有小尖峰，可留意。")
+    f"- **小飞机袋**（1~2 件）：按 **≈ {small_avg:.0f} 个/天** 备货。\n"
+    f"- **大飞机袋**（含装盒单拆出的多个大袋）：按 **≈ {big_avg:.0f} 个/天** 备货。\n"
+    f"- **飞机盒**（≤9/14 >{BAG_CAP_OLD} 副、≥9/15 ≥{BAG_CAP_NEW+1} 副；每盒 {BOX_BAGS} 袋）：按 **≈ {box_avg:.1f} 个/天** 备货。\n"
+    f"- **工具包**：按 **≈ {kit_avg:.0f} 个/天** 备货（小袋自带 {SMALL_BUILTIN}、大袋自带 {BIG_BUILTIN}；装盒单逐袋算）。")
+st.caption("飞机盒装大飞机袋、每盒 2 袋；达人批量发货日会有小尖峰，可留意。")
 
 with st.expander("📖 计算口径与假设"):
     st.markdown("""
@@ -560,8 +591,8 @@ with st.expander("📖 计算口径与假设"):
 - **TikTok**：1 Order ID = 1 单，指甲 SKU 行数 = 副数；免费赠指甲($0 行)已在表内自动计入。
 - **独立站**：1 订单号 = 1 单，指甲 Lineitem 行数 = 副数；免费赠指甲不在表内，用「买副赠·指甲(独立站)」补。
 - **水单（深度达人单 + 普通水单【客人+广达】合并为「水单」）**：1 handle(或 Order ID) = 1 单，款式名数(逗号分隔) = 件数；发货清单已含实发赠品，不叠加赠品。款式名里的 storage box/binder/kit/remover/pen 等**配件名**只是**不计入指甲件数**（不当指甲），不再影响袋型。
-- **包装（纯按指甲件数分档）**：**1~小袋上限 件 → 小飞机袋；到 5 件 → 大飞机袋；6 件及以上 → 飞机盒**。每单恰好 1 个包装(0 件除外)。小袋上限由规则③决定(默认 2，即 3 件起走大袋；切「小袋」则到 3 件仍小袋)。**不再按配件占位换袋。**
-- **工具包**：小袋 = max(0, 件数 − 小袋自带)；大袋 = max(0, 件数 − 大袋自带)；**飞机盒无工具包(记 0)**。规则④手动设自带数(0/1/2/3，默认小 1、大 3；缺大袋改自购时把大袋设 0)。例(小1/大3)：1件→0、2件→1、3件→0、4件→1、5件→2、6件→0(盒)。独立站赠指甲要计入需在「规则②·买副赠·指甲」配置并启用。
-- **件数分布表**：近 7/14 天各件数(1/2/3/4/5/6+)的包裹数，用于复核；「6 件及以上」= 飞机盒消耗。
+- **包装（按订单日期自动切换）**：1~2 副 → 1 个小飞机袋（两个时段一致）。**≤ 9/14（旧）**：3~10 副 → 1 个大飞机袋；>10 副 → 飞机盒。**≥ 9/15（新 · 以后默认）**：3~8 副 → 1 个大飞机袋；≥9 副 → 飞机盒。**装盒**：指甲先按当期容量(旧 10/新 8)拆成多个大飞机袋(向上取整)，大飞机袋每 2 个装进 1 个飞机盒(向上取整)。例(新策略)：9 副=2 袋 1 盒、16 副=2 袋 1 盒、17 副=3 袋 2 盒。**不再按配件占位换袋。**
+- **工具包**：每个袋内 max(0, 袋内件数 − 该袋自带) 之和；小袋按小袋自带、大袋按大袋自带；**飞机盒只是外层容器、本身不带工具包**（装盒的单拆成多个大飞机袋后逐袋算）。规则③手动设自带数(小袋 0~3、大袋 0~10，默认小 1、大 3；缺大袋改自购时把大袋设 0)。例(小1/大3 · 新策略每袋≤8)：1件→0、3件→0、8件→5、9件(2袋)→5、16件(2袋)→10、17件(3袋)→10。独立站赠指甲要计入需在「规则②·买副赠·指甲」配置并启用。
+- **件数分布表**：近 7/14 天各件数(1/2/3~8/9~10/11+)的包裹数，用于复核；9~10 副按订单日期分档不同(≤9/14 大飞机袋、≥9/15 飞机盒)，实际大飞机袋/飞机盒个数见表下说明与上方汇总。
 - **过去 7/14 天**：以表内最后一天为基准往前推 7 / 14 个自然日；日均 = 合计 ÷ 7(或 14)。
     """)
